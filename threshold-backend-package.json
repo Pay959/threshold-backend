@@ -1,0 +1,14 @@
+{
+  "name": "threshold-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.2",
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "stripe": "^16.12.0"
+  }
+}
