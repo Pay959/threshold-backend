@@ -14,7 +14,32 @@ const { registerSiteBuilderRoutes } = require("./sitebuilder");
 const { registerBillingRoutes } = require("./billing");
 
 const app = express();
-app.use(cors());
+
+// CORS — allow the browser frontend to call this API.
+// Must run before any routes are registered, and must answer OPTIONS
+// preflight requests or browsers will block every POST.
+app.use(cors({
+  origin: true,            // reflect whatever origin is asking
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "stripe-signature"],
+}));
+
+// Explicitly answer preflight for every route.
+app.options(/.*/, cors());
+
+// Belt-and-braces: set the headers manually too, in case anything
+// bypasses the cors() middleware.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, stripe-signature");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// Simple health check so you can confirm the backend is alive in a browser.
+app.get("/", (req, res) => res.json({ status: "ok", service: "threshold-backend" }));
 
 const RETELL_API_KEY = process.env.RETELL_API_KEY;
 const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID;
