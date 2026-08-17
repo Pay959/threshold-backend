@@ -25,8 +25,8 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization", "stripe-signature"],
 }));
 
-// Explicitly answer preflight for every route.
-app.options(/.*/, cors());
+// Preflight OPTIONS requests are handled by the middleware below,
+// which works consistently across Express versions.
 
 // Belt-and-braces: set the headers manually too, in case anything
 // bypasses the cors() middleware.
@@ -40,6 +40,75 @@ app.use((req, res, next) => {
 
 // Simple health check so you can confirm the backend is alive in a browser.
 app.get("/", (req, res) => res.json({ status: "ok", service: "threshold-backend" }));
+
+/* -----------------------------------------------------------
+   GET /api/diagnostics
+   Open this in your browser to see exactly what's configured
+   and what Retell says. Reports problems in plain language.
+----------------------------------------------------------- */
+app.get("/api/diagnostics", async (req, res) => {
+  const report = { summary: "", problems: [], checks: [] };
+
+  function check(name, ok, detail) {
+    report.checks.push({ name, ok: ok ? "PASS" : "FAIL", detail });
+    if (!ok) report.problems.push(`${name} — ${detail}`);
+  }
+
+  check("Supabase URL configured", !!SUPABASE_URL, SUPABASE_URL ? "ok" : "missing");
+  check("Supabase key configured", !!SUPABASE_SERVICE_KEY, SUPABASE_SERVICE_KEY ? "ok" : "missing");
+  check("Retell API key configured", !!RETELL_API_KEY, RETELL_API_KEY ? "ok" : "MISSING — add RETELL_API_KEY in Railway Variables");
+  check("Retell agent ID configured", !!RETELL_AGENT_ID, RETELL_AGENT_ID || "MISSING — add RETELL_AGENT_ID in Railway Variables");
+  check("Retell from-number configured", !!RETELL_FROM_NUMBER, RETELL_FROM_NUMBER || "MISSING — add RETELL_FROM_NUMBER in Railway Variables");
+
+  const normalized = toE164(RETELL_FROM_NUMBER);
+  check("From-number format valid", !!normalized,
+    normalized ? `${RETELL_FROM_NUMBER} reads as ${normalized}` : `"${RETELL_FROM_NUMBER}" is not valid. Use +1 then 10 digits.`);
+
+  if (RETELL_API_KEY) {
+    try {
+      const r = await fetch("https://api.retellai.com/list-phone-numbers", {
+        headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
+      });
+      const text = await r.text();
+
+      if (r.status === 401 || r.status === 403) {
+        check("Retell API key accepted", false, "Retell rejected your API key. Check for typos or extra spaces in Railway.");
+      } else if (!r.ok) {
+        check("Retell reachable", false, `Retell returned ${r.status}: ${text.slice(0, 300)}`);
+      } else {
+        check("Retell API key accepted", true, "ok");
+        let numbers = [];
+        try { numbers = JSON.parse(text); } catch { numbers = []; }
+        if (!Array.isArray(numbers)) numbers = [];
+
+        report.numbers_in_your_retell_account = numbers.map((n) => ({
+          number: n.phone_number,
+          outbound_agent_id: n.outbound_agent_id || "NONE — outbound calls disabled",
+          inbound_agent_id: n.inbound_agent_id || "none",
+        }));
+
+        const match = numbers.find((n) => n.phone_number === normalized);
+        check("From-number found in Retell", !!match,
+          match ? "ok" : `${normalized} not found. Your account has: ${numbers.map(n => n.phone_number).join(", ") || "no numbers"}`);
+
+        if (match) {
+          check("Outbound agent bound to number", !!match.outbound_agent_id,
+            match.outbound_agent_id
+              ? `bound to ${match.outbound_agent_id}`
+              : "THIS IS THE PROBLEM. No outbound agent is bound. In Retell, open this phone number and change 'Outbound Call Agent' from None to your agent, then save.");
+        }
+      }
+    } catch (err) {
+      check("Retell reachable", false, `Network error: ${err.message}`);
+    }
+  }
+
+  report.summary = report.problems.length === 0
+    ? "All checks passed. If calls still fail, check your Retell account balance."
+    : `${report.problems.length} problem(s) found. Read 'problems' below.`;
+
+  res.json(report);
+});
 
 const RETELL_API_KEY = process.env.RETELL_API_KEY;
 const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID;
@@ -62,11 +131,35 @@ app.use(express.json({ limit: "2mb" }));
    Places a real outbound call via Retell AI, using the lead's
    business info as dynamic variables the agent can reference.
 ----------------------------------------------------------- */
+/* Convert whatever the user typed into E.164 format (+1XXXXXXXXXX),
+   which is the only format Retell accepts. Handles "(410) 555-0100",
+   "410-555-0100", "4105550100", "1-410-555-0100", etc. */
+function toE164(raw) {
+  if (!raw) return null;
+  const trimmed = String(raw).trim();
+  if (trimmed.startsWith("+")) return trimmed.replace(/[^\d+]/g, "");
+  const digits = trimmed.replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (digits.length > 11) return `+${digits}`;
+  return null; // too short to be valid
+}
+
 app.post("/api/calls/start", async (req, res) => {
-  const { orgId, leadId, leadName, leadNumber, businessName } = req.body;
+  const { orgId, leadId, leadName, leadNumber, businessName } = req.body || {};
 
   if (!orgId || !leadId || !leadNumber) {
     return res.status(400).json({ error: "orgId, leadId, and leadNumber are required" });
+  }
+
+  const toNumber = toE164(leadNumber);
+  if (!toNumber) {
+    return res.status(400).json({ error: `"${leadNumber}" doesn't look like a valid phone number.` });
+  }
+
+  const fromNumber = toE164(RETELL_FROM_NUMBER);
+  if (!fromNumber) {
+    return res.status(500).json({ error: "The calling number isn't configured correctly on the server." });
   }
 
   try {
@@ -102,8 +195,8 @@ app.post("/api/calls/start", async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from_number: RETELL_FROM_NUMBER,
-        to_number: leadNumber,
+        from_number: fromNumber,
+        to_number: toNumber,
         override_agent_id: RETELL_AGENT_ID,
         retell_llm_dynamic_variables: {
           lead_name: leadName || "there",
@@ -113,10 +206,17 @@ app.post("/api/calls/start", async (req, res) => {
       }),
     });
 
-    const retellData = await retellRes.json();
+    const retellText = await retellRes.text();
+    let retellData;
+    try { retellData = JSON.parse(retellText); } catch { retellData = { raw: retellText }; }
 
     if (!retellRes.ok) {
-      return res.status(502).json({ error: "Retell call failed", details: retellData });
+      console.error("Retell rejected the call:", retellRes.status, retellText);
+      const reason =
+        (retellData && (retellData.message || retellData.error || retellData.detail)) ||
+        retellText ||
+        "Unknown error";
+      return res.status(502).json({ error: `Retell: ${reason}` });
     }
 
     // Log the call as in-progress
