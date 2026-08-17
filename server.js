@@ -81,10 +81,19 @@ app.get("/api/diagnostics", async (req, res) => {
         try { numbers = JSON.parse(text); } catch { numbers = []; }
         if (!Array.isArray(numbers)) numbers = [];
 
+        // Retell replaced outbound_agent_id with an outbound_agents array
+        // (deprecation effective 2026-03-31). Support both, preferring the new one.
+        function agentsOf(n, kind) {
+          const list = n[`${kind}_agents`];
+          if (Array.isArray(list) && list.length) return list.map((a) => a.agent_id);
+          const legacy = n[`${kind}_agent_id`];
+          return legacy ? [legacy] : [];
+        }
+
         report.numbers_in_your_retell_account = numbers.map((n) => ({
           number: n.phone_number,
-          outbound_agent_id: n.outbound_agent_id || "NONE — outbound calls disabled",
-          inbound_agent_id: n.inbound_agent_id || "none",
+          outbound_agents: agentsOf(n, "outbound"),
+          inbound_agents: agentsOf(n, "inbound"),
         }));
 
         const match = numbers.find((n) => n.phone_number === normalized);
@@ -92,10 +101,11 @@ app.get("/api/diagnostics", async (req, res) => {
           match ? "ok" : `${normalized} not found. Your account has: ${numbers.map(n => n.phone_number).join(", ") || "no numbers"}`);
 
         if (match) {
-          check("Outbound agent bound to number", !!match.outbound_agent_id,
-            match.outbound_agent_id
-              ? `bound to ${match.outbound_agent_id}`
-              : "THIS IS THE PROBLEM. No outbound agent is bound. In Retell, open this phone number and change 'Outbound Call Agent' from None to your agent, then save.");
+          const outbound = agentsOf(match, "outbound");
+          check("Outbound agent bound to number", outbound.length > 0,
+            outbound.length
+              ? `bound to ${outbound.join(", ")}`
+              : "No outbound agent bound. In Retell, open this phone number and set 'Outbound Call Agent' to your agent, then save. Or visit /api/fix-outbound-agent to bind it automatically.");
         }
       }
     } catch (err) {
@@ -124,6 +134,66 @@ registerBillingRoutes(app, supabase);
 
 // Every other route can use normal JSON parsing.
 app.use(express.json({ limit: "2mb" }));
+
+/* -----------------------------------------------------------
+   GET /api/fix-outbound-agent
+   Binds your agent to your phone number directly through Retell's
+   API, bypassing the dashboard. Visit this once in a browser.
+----------------------------------------------------------- */
+app.get("/api/fix-outbound-agent", async (req, res) => {
+  if (!RETELL_API_KEY || !RETELL_AGENT_ID || !RETELL_FROM_NUMBER) {
+    return res.status(400).json({
+      error: "Missing config. Need RETELL_API_KEY, RETELL_AGENT_ID and RETELL_FROM_NUMBER in Railway.",
+    });
+  }
+
+  const number = toE164(RETELL_FROM_NUMBER);
+  if (!number) {
+    return res.status(400).json({ error: `"${RETELL_FROM_NUMBER}" is not a valid phone number.` });
+  }
+
+  try {
+    // Retell's current API uses weighted agent lists, not single agent IDs.
+    // For a single agent, use one entry with weight 1.
+    const patchRes = await fetch(`https://api.retellai.com/update-phone-number/${encodeURIComponent(number)}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${RETELL_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        outbound_agents: [{ agent_id: RETELL_AGENT_ID, weight: 1 }],
+        inbound_agents: [{ agent_id: RETELL_AGENT_ID, weight: 1 }],
+      }),
+    });
+
+    const text = await patchRes.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    if (!patchRes.ok) {
+      console.error("Failed to bind agent:", patchRes.status, text);
+      return res.status(502).json({
+        success: false,
+        status: patchRes.status,
+        retell_said: data,
+        hint: "If this failed, the agent ID or number may be wrong. Check /api/diagnostics.",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Agent bound to your phone number. Outbound calling should now work.",
+      number,
+      outbound_agents: data.outbound_agents || [{ agent_id: RETELL_AGENT_ID, weight: 1 }],
+      inbound_agents: data.inbound_agents || [{ agent_id: RETELL_AGENT_ID, weight: 1 }],
+      next_step: "Open /api/diagnostics to confirm, then try a call from your site.",
+    });
+  } catch (err) {
+    console.error("Error binding agent:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 /* -----------------------------------------------------------
    POST /api/calls/start
