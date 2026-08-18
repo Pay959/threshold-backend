@@ -5,6 +5,7 @@
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
 const VERCEL_TEAM_ID = process.env.VERCEL_TEAM_ID; // optional, only if deploying under a team
+const NETLIFY_TOKEN = process.env.NETLIFY_TOKEN;
 
 /* -----------------------------------------------------------
    Generates a single-file HTML site for a business using Claude,
@@ -91,6 +92,130 @@ Output the raw HTML only.`;
    Deploys the generated HTML as a static site to Vercel.
    Returns the live URL.
 ----------------------------------------------------------- */
+/* -----------------------------------------------------------
+   Deploys the generated HTML to Netlify.
+   Netlify's API is more permissive than Vercel's for programmatic
+   site creation, so this is the default when NETLIFY_TOKEN is set.
+----------------------------------------------------------- */
+async function deployToNetlify(slug, html) {
+  if (!NETLIFY_TOKEN) {
+    throw new Error("NETLIFY_TOKEN is not set in Railway Variables.");
+  }
+
+  // 1. Create a new site
+  const createRes = await fetch("https://api.netlify.com/api/v1/sites", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${NETLIFY_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ name: slug }),
+  });
+
+  const createText = await createRes.text();
+  let site;
+  try { site = JSON.parse(createText); } catch { site = {}; }
+
+  if (!createRes.ok) {
+    console.error("Netlify site creation failed:", createRes.status, createText);
+    const msg = site.message || createText.slice(0, 250);
+    if (createRes.status === 401) {
+      throw new Error(`Netlify rejected the token. Check NETLIFY_TOKEN in Railway. (${msg})`);
+    }
+    throw new Error(`Netlify site creation failed: ${msg}`);
+  }
+
+  // 2. Deploy the HTML as a zip containing index.html
+  const zipBuffer = await makeSingleFileZip("index.html", html);
+
+  const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${site.id}/deploys`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${NETLIFY_TOKEN}`,
+      "Content-Type": "application/zip",
+    },
+    body: zipBuffer,
+  });
+
+  const deployText = await deployRes.text();
+  if (!deployRes.ok) {
+    console.error("Netlify deploy failed:", deployRes.status, deployText);
+    throw new Error(`Netlify deploy failed: ${deployText.slice(0, 250)}`);
+  }
+
+  return site.ssl_url || site.url || `https://${site.name}.netlify.app`;
+}
+
+/* Build a minimal zip in memory containing one file.
+   Netlify accepts a zip upload for deploys. */
+function makeSingleFileZip(filename, content) {
+  const zlib = require("zlib");
+  const nameBuf = Buffer.from(filename, "utf8");
+  const dataBuf = Buffer.from(content, "utf8");
+  const deflated = zlib.deflateRawSync(dataBuf);
+
+  const crcTable = (() => {
+    const table = [];
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  let crc = 0xffffffff;
+  for (const b of dataBuf) crc = crcTable[(crc ^ b) & 0xff] ^ (crc >>> 8);
+  crc = (crc ^ 0xffffffff) >>> 0;
+
+  const localHeader = Buffer.alloc(30);
+  localHeader.writeUInt32LE(0x04034b50, 0);
+  localHeader.writeUInt16LE(20, 4);
+  localHeader.writeUInt16LE(0, 6);
+  localHeader.writeUInt16LE(8, 8);
+  localHeader.writeUInt16LE(0, 10);
+  localHeader.writeUInt16LE(0, 12);
+  localHeader.writeUInt32LE(crc, 14);
+  localHeader.writeUInt32LE(deflated.length, 18);
+  localHeader.writeUInt32LE(dataBuf.length, 22);
+  localHeader.writeUInt16LE(nameBuf.length, 26);
+  localHeader.writeUInt16LE(0, 28);
+
+  const centralHeader = Buffer.alloc(46);
+  centralHeader.writeUInt32LE(0x02014b50, 0);
+  centralHeader.writeUInt16LE(20, 4);
+  centralHeader.writeUInt16LE(20, 6);
+  centralHeader.writeUInt16LE(0, 8);
+  centralHeader.writeUInt16LE(8, 10);
+  centralHeader.writeUInt16LE(0, 12);
+  centralHeader.writeUInt16LE(0, 14);
+  centralHeader.writeUInt32LE(crc, 16);
+  centralHeader.writeUInt32LE(deflated.length, 20);
+  centralHeader.writeUInt32LE(dataBuf.length, 24);
+  centralHeader.writeUInt16LE(nameBuf.length, 28);
+  centralHeader.writeUInt16LE(0, 30);
+  centralHeader.writeUInt16LE(0, 32);
+  centralHeader.writeUInt16LE(0, 34);
+  centralHeader.writeUInt16LE(0, 36);
+  centralHeader.writeUInt32LE(0, 38);
+  centralHeader.writeUInt32LE(0, 42);
+
+  const localPart = Buffer.concat([localHeader, nameBuf, deflated]);
+  const centralPart = Buffer.concat([centralHeader, nameBuf]);
+
+  const endRecord = Buffer.alloc(22);
+  endRecord.writeUInt32LE(0x06054b50, 0);
+  endRecord.writeUInt16LE(0, 4);
+  endRecord.writeUInt16LE(0, 6);
+  endRecord.writeUInt16LE(1, 8);
+  endRecord.writeUInt16LE(1, 10);
+  endRecord.writeUInt32LE(centralPart.length, 12);
+  endRecord.writeUInt32LE(localPart.length, 16);
+  endRecord.writeUInt16LE(0, 20);
+
+  return Buffer.concat([localPart, centralPart, endRecord]);
+}
+
 async function deployToVercel(slug, html) {
   if (!VERCEL_TOKEN) {
     throw new Error("VERCEL_TOKEN is not set in Railway Variables.");
@@ -181,7 +306,11 @@ function registerSiteBuilderRoutes(app, supabase) {
         .replace(/(^-|-$)/g, "")
         .slice(0, 50);
 
-      const liveUrl = await deployToVercel(slug, html);
+      // Prefer Netlify if a token is set — its API is more permissive
+      // for programmatic site creation. Fall back to Vercel otherwise.
+      const liveUrl = NETLIFY_TOKEN
+        ? await deployToNetlify(slug, html)
+        : await deployToVercel(slug, html);
 
       await supabase
         .from("generated_sites")
