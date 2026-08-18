@@ -30,30 +30,61 @@ Requirements:
 
 Output the raw HTML only.`;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4000,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error("ANTHROPIC_API_KEY is not set in Railway Variables.");
+  }
 
-  const data = await res.json();
-  if (!res.ok) throw new Error("Claude generation failed: " + JSON.stringify(data));
+  // Try current models in order — if one isn't available on this account, fall back.
+  const models = ["claude-sonnet-4-5", "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022"];
+  let lastError = "";
 
-  const textBlock = data.content.find((b) => b.type === "text");
-  let html = textBlock ? textBlock.text : "";
+  for (const model of models) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 8000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
 
-  // Strip markdown fences if Claude added them despite instructions
-  html = html.replace(/^```html\n?/, "").replace(/```$/, "").trim();
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = {}; }
 
-  return html;
+    if (!res.ok) {
+      const msg = (data.error && data.error.message) || text.slice(0, 300);
+      lastError = `${model}: ${msg}`;
+      console.error("Claude call failed:", res.status, lastError);
+      // Credit/auth problems won't be fixed by trying another model
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(`Anthropic rejected the API key. ${msg}`);
+      }
+      if (msg.toLowerCase().includes("credit") || msg.toLowerCase().includes("balance")) {
+        throw new Error(`Anthropic account has no credits. Add credits at console.anthropic.com. (${msg})`);
+      }
+      continue; // try the next model
+    }
+
+    const textBlock = (data.content || []).find((b) => b.type === "text");
+    let html = textBlock ? textBlock.text : "";
+    html = html.replace(/^```html\n?/, "").replace(/^```\n?/, "").replace(/```$/, "").trim();
+
+    if (!html || !html.toLowerCase().includes("<html")) {
+      lastError = `${model}: response didn't contain valid HTML`;
+      continue;
+    }
+
+    console.log(`Site generated with ${model}, ${html.length} chars`);
+    return html;
+  }
+
+  throw new Error(`All models failed. Last error — ${lastError}`);
 }
 
 /* -----------------------------------------------------------
@@ -61,6 +92,10 @@ Output the raw HTML only.`;
    Returns the live URL.
 ----------------------------------------------------------- */
 async function deployToVercel(slug, html) {
+  if (!VERCEL_TOKEN) {
+    throw new Error("VERCEL_TOKEN is not set in Railway Variables.");
+  }
+
   const teamQuery = VERCEL_TEAM_ID ? `?teamId=${VERCEL_TEAM_ID}` : "";
 
   const res = await fetch(`https://api.vercel.com/v13/deployments${teamQuery}`, {
@@ -85,8 +120,18 @@ async function deployToVercel(slug, html) {
     }),
   });
 
-  const data = await res.json();
-  if (!res.ok) throw new Error("Vercel deploy failed: " + JSON.stringify(data));
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = {}; }
+
+  if (!res.ok) {
+    const msg = (data.error && (data.error.message || data.error.code)) || text.slice(0, 300);
+    console.error("Vercel deploy failed:", res.status, text);
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(`Vercel rejected the token. Check VERCEL_TOKEN in Railway. (${msg})`);
+    }
+    throw new Error(`Vercel deploy failed: ${msg}`);
+  }
 
   // data.url is something like "slug-xxxxx.vercel.app"
   return `https://${data.url}`;
@@ -146,7 +191,7 @@ function registerSiteBuilderRoutes(app, supabase) {
       res.json({ success: true, url: liveUrl, siteId: siteRow.id });
     } catch (err) {
       console.error("Site generation error:", err);
-      res.status(500).json({ error: "Site generation failed", details: err.message });
+      res.status(500).json({ error: err.message || "Site generation failed" });
     }
   });
 }
