@@ -131,6 +131,72 @@ app.get("/api/diagnostics", async (req, res) => {
             is_published: agent.is_published,
           };
           check("Agent found in Retell", true, `${agent.agent_name || "unnamed"} (version ${agent.version})`);
+
+          // If this is a conversation flow agent, inspect the flow itself —
+          // that's where the prompt text and variable config actually live.
+          const engine = agent.response_engine || {};
+          report.flow_lookup_attempted = engine.conversation_flow_id || "no conversation_flow_id on agent";
+
+          if (engine.conversation_flow_id) {
+            const flowId = engine.conversation_flow_id;
+            const urls = [
+              `https://api.retellai.com/get-conversation-flow/${encodeURIComponent(flowId)}`,
+              `https://api.retellai.com/get-conversation-flow/${encodeURIComponent(flowId)}?version=${engine.version || agent.version}`,
+            ];
+
+            let flow = null;
+            let lastErr = "";
+            for (const u of urls) {
+              try {
+                const fRes = await fetch(u, { headers: { Authorization: `Bearer ${RETELL_API_KEY}` } });
+                const fText = await fRes.text();
+                if (fRes.ok) {
+                  try { flow = JSON.parse(fText); } catch { lastErr = "could not parse flow JSON"; }
+                  if (flow) break;
+                } else {
+                  lastErr = `${fRes.status} from ${u} — ${fText.slice(0, 150)}`;
+                }
+              } catch (err) {
+                lastErr = err.message;
+              }
+            }
+
+            if (!flow) {
+              check("Conversation flow readable", false, lastErr || "unknown error");
+            } else {
+              const nodes = Array.isArray(flow.nodes) ? flow.nodes : [];
+              const allText = JSON.stringify(flow);
+
+              report.your_flow = {
+                conversation_flow_id: flow.conversation_flow_id,
+                node_count: nodes.length,
+                default_dynamic_variables: flow.default_dynamic_variables || "none set",
+                global_prompt_preview: (flow.global_prompt || "").slice(0, 300) || "none",
+                nodes: nodes.map((n) => ({
+                  id: n.id,
+                  type: n.type,
+                  text_preview: (
+                    (n.instruction && n.instruction.text) ||
+                    n.static_text ||
+                    n.text ||
+                    ""
+                  ).slice(0, 250),
+                })),
+              };
+
+              check("Flow uses {{business_name}}", allText.includes("{{business_name}}"),
+                allText.includes("{{business_name}}")
+                  ? "found in your flow"
+                  : "NOT FOUND — add {{business_name}} to your node text where you want the name spoken");
+              check("Flow uses {{lead_name}}", allText.includes("{{lead_name}}"),
+                allText.includes("{{lead_name}}") ? "found" : "not used (optional)");
+            }
+          }
+
+          check("Agent is published", agent.is_published === true,
+            agent.is_published
+              ? "ok"
+              : "NOT PUBLISHED. In Retell, click Publish on your agent. Unpublished changes don't reach live calls.");
         } else {
           check("Agent found in Retell", false, `Retell returned ${aRes.status} for agent ${RETELL_AGENT_ID}: ${aText.slice(0, 200)}`);
         }
@@ -334,6 +400,11 @@ app.post("/api/calls/start", async (req, res) => {
     return res.status(500).json({ error: "The calling number isn't configured correctly on the server." });
   }
 
+  console.log("Call variables →", JSON.stringify({
+    lead_name: String(leadName || "there"),
+    business_name: String(businessName || "your business"),
+  }));
+
   try {
     // Check org's remaining minutes before placing the call (skip check for platform owner)
     const { data: org } = await supabase
@@ -374,8 +445,8 @@ app.post("/api/calls/start", async (req, res) => {
         // instead of the one you most recently published.
         override_agent_version: "latest_published",
         retell_llm_dynamic_variables: {
-          lead_name: leadName || "there",
-          business_name: businessName || "your business",
+          lead_name: String(leadName || "there"),
+          business_name: String(businessName || "your business"),
         },
         metadata: { orgId, leadId }, // comes back on the webhook so we know which lead/org this call belongs to
       }),
@@ -484,8 +555,31 @@ app.get("/api/calls/:externalCallId", async (req, res) => {
     const retellRes = await fetch(`https://api.retellai.com/v2/get-call/${req.params.externalCallId}`, {
       headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
     });
-    const data = await retellRes.json();
-    res.json(data);
+    const text = await retellRes.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = {}; }
+
+    if (!retellRes.ok) {
+      return res.status(retellRes.status).json({ error: "Could not fetch call", detail: text.slice(0, 200) });
+    }
+
+    // Turn Retell's transcript into a simple list the UI can render.
+    // transcript_object is an array of { role, content } once available.
+    const turns = Array.isArray(data.transcript_object)
+      ? data.transcript_object.map((t) => ({
+          role: t.role === "agent" ? "agent" : "contact",
+          text: t.content || "",
+        }))
+      : [];
+
+    res.json({
+      call_id: data.call_id,
+      status: data.call_status,            // registered | ongoing | ended | error
+      disconnection_reason: data.disconnection_reason || null,
+      duration_seconds: data.duration_ms ? Math.round(data.duration_ms / 1000) : 0,
+      turns,
+      recording_url: data.recording_url || null,
+    });
   } catch (err) {
     res.status(500).json({ error: "Could not fetch call status" });
   }
