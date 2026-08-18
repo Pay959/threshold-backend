@@ -29,7 +29,15 @@ Requirements:
 - Real, tasteful color palette and typography — not generic Bootstrap defaults
 - No placeholder "lorem ipsum" — write real, specific-sounding copy for this business
 
-Output the raw HTML only.`;
+Output the raw HTML only.
+
+CRITICAL OUTPUT RULES:
+- Your entire response must be a single HTML document
+- Start with <!DOCTYPE html> as the very first characters
+- End with </html> as the very last characters
+- Do NOT wrap it in markdown code fences
+- Do NOT write any explanation before or after
+- Do NOT say "Here is your website" or anything similar`;
 
   if (!ANTHROPIC_API_KEY) {
     throw new Error("ANTHROPIC_API_KEY is not set in Railway Variables.");
@@ -74,14 +82,37 @@ Output the raw HTML only.`;
 
     const textBlock = (data.content || []).find((b) => b.type === "text");
     let html = textBlock ? textBlock.text : "";
-    html = html.replace(/^```html\n?/, "").replace(/^```\n?/, "").replace(/```$/, "").trim();
 
-    if (!html || !html.toLowerCase().includes("<html")) {
+    // Claude sometimes wraps output in markdown fences or adds a sentence
+    // before/after. Extract just the HTML document itself.
+    html = html.trim();
+
+    // Strip any markdown code fences anywhere in the response
+    html = html.replace(/```[a-zA-Z]*\n?/g, "").replace(/```/g, "");
+
+    // Find the real start of the document and cut everything before it
+    const doctypeIdx = html.search(/<!DOCTYPE\s+html/i);
+    const htmlTagIdx = html.search(/<html[\s>]/i);
+    const startIdx = doctypeIdx >= 0 ? doctypeIdx : htmlTagIdx;
+    if (startIdx > 0) html = html.slice(startIdx);
+
+    // Cut anything after the closing tag
+    const endIdx = html.toLowerCase().lastIndexOf("</html>");
+    if (endIdx >= 0) html = html.slice(0, endIdx + 7);
+
+    html = html.trim();
+
+    // If Claude returned a fragment without <html>, wrap it so browsers render it
+    if (html && !/<html[\s>]/i.test(html)) {
+      html = `<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>${business.name}</title>\n</head>\n<body>\n${html}\n</body>\n</html>`;
+    }
+
+    if (!html || !/<html[\s>]/i.test(html)) {
       lastError = `${model}: response didn't contain valid HTML`;
       continue;
     }
 
-    console.log(`Site generated with ${model}, ${html.length} chars`);
+    console.log(`Site generated with ${model}, ${html.length} chars, starts with: ${html.slice(0, 60)}`);
     return html;
   }
 
