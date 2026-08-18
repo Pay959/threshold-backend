@@ -111,6 +111,33 @@ app.get("/api/diagnostics", async (req, res) => {
     } catch (err) {
       check("Retell reachable", false, `Network error: ${err.message}`);
     }
+
+    // Fetch the agent itself so you can see which prompt Retell actually has.
+    if (RETELL_AGENT_ID) {
+      try {
+        const aRes = await fetch(`https://api.retellai.com/get-agent/${encodeURIComponent(RETELL_AGENT_ID)}`, {
+          headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
+        });
+        const aText = await aRes.text();
+        if (aRes.ok) {
+          let agent = {};
+          try { agent = JSON.parse(aText); } catch { agent = {}; }
+          report.your_agent = {
+            agent_id: agent.agent_id,
+            agent_name: agent.agent_name,
+            version: agent.version,
+            voice_id: agent.voice_id,
+            response_engine: agent.response_engine,
+            is_published: agent.is_published,
+          };
+          check("Agent found in Retell", true, `${agent.agent_name || "unnamed"} (version ${agent.version})`);
+        } else {
+          check("Agent found in Retell", false, `Retell returned ${aRes.status} for agent ${RETELL_AGENT_ID}: ${aText.slice(0, 200)}`);
+        }
+      } catch (err) {
+        check("Agent lookup", false, err.message);
+      }
+    }
   }
 
   report.summary = report.problems.length === 0
@@ -196,6 +223,81 @@ app.get("/api/fix-outbound-agent", async (req, res) => {
 });
 
 /* -----------------------------------------------------------
+   GET /api/tune-agent
+   Sets the speech settings that make the agent feel less robotic:
+   backchanneling, ambient sound, fast responsiveness.
+   Visit this once in a browser after changing anything.
+----------------------------------------------------------- */
+app.get("/api/tune-agent", async (req, res) => {
+  if (!RETELL_API_KEY || !RETELL_AGENT_ID) {
+    return res.status(400).json({ error: "Need RETELL_API_KEY and RETELL_AGENT_ID in Railway." });
+  }
+
+  // Allow overriding via query string, e.g. /api/tune-agent?ambient=office
+  const ambient = req.query.ambient || "static-noise";
+  const frequency = req.query.frequency ? Number(req.query.frequency) : 0.7;
+
+  const settings = {
+    enable_backchannel: true,
+    backchannel_frequency: frequency,
+    backchannel_words: ["yeah", "okay", "got it", "right", "mhm"],
+    responsiveness: 1,
+    interruption_sensitivity: 0.9,
+    enable_dynamic_responsiveness: false,
+    ambient_sound: ambient,
+    ambient_sound_volume: 0.3,
+    voice_speed: 1,
+  };
+
+  try {
+    const r = await fetch(`https://api.retellai.com/update-agent/${encodeURIComponent(RETELL_AGENT_ID)}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${RETELL_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(settings),
+    });
+
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    if (!r.ok) {
+      console.error("Failed to tune agent:", r.status, text);
+      return res.status(502).json({
+        success: false,
+        status: r.status,
+        retell_said: data,
+        hint: "If ambient_sound was rejected, try /api/tune-agent?ambient=none",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Agent tuned. Backchanneling on, ambient sound added, responsiveness maxed.",
+      applied: {
+        backchannel: data.enable_backchannel,
+        backchannel_frequency: data.backchannel_frequency,
+        backchannel_words: data.backchannel_words,
+        responsiveness: data.responsiveness,
+        interruption_sensitivity: data.interruption_sensitivity,
+        ambient_sound: data.ambient_sound,
+      },
+      note: "You may need to publish the agent in Retell for changes to reach live calls.",
+      tips: {
+        less_chatty: "Visit /api/tune-agent?frequency=0.4",
+        no_background_noise: "Visit /api/tune-agent?ambient=none",
+        other_ambient_options: "coffee-shop, convention-hall, summer-outdoor, mountain-outdoor, static-noise, call-center",
+      },
+    });
+  } catch (err) {
+    console.error("Error tuning agent:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* -----------------------------------------------------------
    POST /api/calls/start
    Body: { orgId, leadId, leadName, leadNumber, businessName }
    Places a real outbound call via Retell AI, using the lead's
@@ -268,6 +370,9 @@ app.post("/api/calls/start", async (req, res) => {
         from_number: fromNumber,
         to_number: toNumber,
         override_agent_id: RETELL_AGENT_ID,
+        // Without this, Retell may use an older saved version of the agent
+        // instead of the one you most recently published.
+        override_agent_version: "latest_published",
         retell_llm_dynamic_variables: {
           lead_name: leadName || "there",
           business_name: businessName || "your business",
